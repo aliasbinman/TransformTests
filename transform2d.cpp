@@ -608,22 +608,34 @@ int main(int argc, char** argv) {
         std::printf("[csv] wrote %s\n", filename);
     };
 
+    // Percent of scalar (row 0) for this grid; lower is better. Rounded to int.
+    auto pct_vs_scalar = [](const Grid& g, int mi, int si) -> int {
+        double s = g[0][si];
+        if (s <= 0.0) return 0;
+        double p = g[mi][si] / s * 100.0;
+        if (p < 0.0) p = 0.0;
+        if (p > 999999.0) p = 999999.0;
+        return static_cast<int>(p + 0.5);
+    };
+
     auto print_grid = [&](const char* label, const std::vector<Method>& ms, const Grid& g) {
-        std::printf("\n=== %s (ms, %d iterations) ===\n", label, ITERATIONS);
+        std::printf("\n=== %s (ms with (NN%%) vs scalar, %d iterations) ===\n", label, ITERATIONS);
         std::printf("  %-18s", "method \\ N");
-        for (int si = 0; si < SIZE_COUNT; ++si) std::printf(" %12zu", sizes[si]);
+        for (int si = 0; si < SIZE_COUNT; ++si) std::printf(" %18zu", sizes[si]);
         std::printf("\n");
         for (int mi = 0; mi < static_cast<int>(ms.size()); ++mi) {
             std::printf("  %-18s", ms[mi].name);
-            for (int si = 0; si < SIZE_COUNT; ++si) std::printf(" %12.4f", g[mi][si]);
+            for (int si = 0; si < SIZE_COUNT; ++si) {
+                std::printf("  %8.4f (%5d%%)", g[mi][si], pct_vs_scalar(g, mi, si));
+            }
             std::printf("\n");
         }
     };
 
     auto print_grid_speedup = [&](const char* label, int nth,
                                   const std::vector<Method>& ms,
-                                  const Grid& g, const Grid& baseline) {
-        std::printf("\n=== %s (ms with (Xx) speedup vs 1-thread, %d iterations, %d threads) ===\n",
+                                  const Grid& g, const Grid& /*baseline*/) {
+        std::printf("\n=== %s (ms with (NN%%) vs scalar, %d iterations, %d threads) ===\n",
                     label, ITERATIONS, nth);
         std::printf("  %-18s", "method \\ N");
         for (int si = 0; si < SIZE_COUNT; ++si) std::printf(" %18zu", sizes[si]);
@@ -631,8 +643,7 @@ int main(int argc, char** argv) {
         for (int mi = 0; mi < static_cast<int>(ms.size()); ++mi) {
             std::printf("  %-18s", ms[mi].name);
             for (int si = 0; si < SIZE_COUNT; ++si) {
-                double ratio = baseline[mi][si] / g[mi][si];
-                std::printf("  %8.4f (%5.2fx)", g[mi][si], ratio);
+                std::printf("  %8.4f (%5d%%)", g[mi][si], pct_vs_scalar(g, mi, si));
             }
             std::printf("\n");
         }

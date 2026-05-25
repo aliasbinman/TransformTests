@@ -42,6 +42,19 @@ CPU: **Intel(R) Core(TM) i7-14700HX**
 
 All times are mean ms per iteration, truncated to 3 significant figures (2 digits after the first non-zero). `(NN%)` is time relative to the scalar baseline of the same table — 100% = same as scalar, lower = faster. Percent is integer-rounded.
 
+### Disclaimer — small-N numbers are noise
+
+Take everything below N=1,000,000 with a grain of salt. A single run at N=1,000 takes ~1 µs; `std::chrono::high_resolution_clock` overhead alone is ~50–100 ns per timestamp pair, so 5–10% of the signal is the clock itself. Add to that:
+
+- **Thermal / turbo flicker.** Modern CPUs change frequency on millisecond timescales. Two back-to-back runs of the same method can land on different P-states.
+- **Hybrid scheduling (i7-14700HX has P-cores + E-cores).** No thread affinity is pinned, so a worker may be scheduled onto an E-core mid-run and skew that sample.
+- **Cache state.** Bench order matters — the first size pays cold-cache costs, later sizes inherit warm L1/L2 from prior iterations. Reordering sizes changes the numbers.
+- **OS noise.** Context switches, interrupts, and background processes add microsecond-scale jitter that dominates µs-scale work.
+- **NT-store variance.** Streaming stores depend on write-combine buffer pressure and memory-controller queue depth; few stores total at small N = no averaging.
+- **Sample size.** Only 100 iterations per cell. Outliers aren't trimmed; the mean (not median) is reported.
+
+Consequence: the same method/size can swing ±50% (occasionally more) between runs at N ≤ 100,000. Don't read small-N ordering as ranking signal — only the N=1,000,000 and N=10,000,000 columns are reliable enough to compare methods. The small-N columns are kept as a rough indication of fixed overhead (function call, thread-pool wakeup, etc.), not throughput.
+
 ### Method names
 
 - `scalar` — plain scalar loop, one point at a time.

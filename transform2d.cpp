@@ -297,7 +297,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    const std::size_t sizes[] = { 10'000, 100'000, 1'000'000, 10'000'000 };
+    const std::size_t sizes[] = { 1'000, 10'000, 100'000, 1'000'000, 10'000'000 };
     constexpr int SIZE_COUNT = sizeof(sizes) / sizeof(sizes[0]);
     constexpr std::size_t MAX_N = 10'000'000;
     constexpr int ITERATIONS = 100;

@@ -91,8 +91,7 @@ struct Method {
     const char* name;
     std::function<void()> run;
     std::function<void()> reset;  // optional: restore in-place buffer from pristine before timing
-    const float* sample_x;
-    const float* sample_y;
+    std::function<Point2(std::size_t)> get;  // read transformed point i from this method's dst
 };
 
 static void transform_points(const Point2* src, Point2* dst, std::size_t n, const Mat3x2& m) {
@@ -291,16 +290,26 @@ static void transform_points_unroll4(const Point2* src, Point2* dst, std::size_t
 
 int main(int argc, char** argv) {
     bool verbose = false;
+    bool do_verify = false;
+    bool do_cold = false;
+    bool do_warm = true;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-v") == 0 || std::strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
+        } else if (std::strcmp(argv[i], "--verify") == 0) {
+            do_verify = true;
+        } else if (std::strcmp(argv[i], "--cold") == 0) {
+            do_cold = true;
+        } else if (std::strcmp(argv[i], "--no-warm") == 0) {
+            do_warm = false;
         }
     }
 
     const std::size_t sizes[] = { 1'000, 10'000, 100'000, 1'000'000, 10'000'000 };
     constexpr int SIZE_COUNT = sizeof(sizes) / sizeof(sizes[0]);
     constexpr std::size_t MAX_N = 10'000'000;
-    constexpr int ITERATIONS = 100;
+    constexpr int ITERATIONS = 21;        // warm: drop iter 0 as warmup, average remaining 20
+    constexpr int WARMUP_ITERS = 1;
     static_assert(MAX_N % 8 == 0, "AoSoA requires MAX_N % 8 == 0");
 
     std::vector<Point2> src(MAX_N);
@@ -347,38 +356,44 @@ int main(int argc, char** argv) {
 
     std::size_t cur_n = 0;
 
+    // Per-layout getters: read point i back out of that method's dst buffer.
+    auto get_aos      = [&](std::size_t i) -> Point2 { return dst[i]; };
+    auto get_soa      = [&](std::size_t i) -> Point2 { return { dst_x[i], dst_y[i] }; };
+    auto get_soa_alig = [&](std::size_t i) -> Point2 { return { dst_x_aligned.get()[i], dst_y_aligned.get()[i] }; };
+    auto get_aosoa    = [&](std::size_t i) -> Point2 { return { dst_aosoa[i / 8].x[i % 8], dst_aosoa[i / 8].y[i % 8] }; };
+
     // ===== Out-of-place methods (read src, write dst) =====
     std::vector<Method> methods;
     methods.push_back({
         "scalar",
         [&]{ transform_points(src.data(), dst.data(), cur_n, mat); },
         {},
-        &dst[0].x, &dst[0].y
+        get_aos
     });
     methods.push_back({
         "unroll4",
         [&]{ transform_points_unroll4(src.data(), dst.data(), cur_n, mat); },
         {},
-        &dst[0].x, &dst[0].y
+        get_aos
     });
     methods.push_back({
         "sse",
         [&]{ transform_points_sse(src.data(), dst.data(), cur_n, mat); },
         {},
-        &dst[0].x, &dst[0].y
+        get_aos
     });
     methods.push_back({
         "sse_soa",
         [&]{ transform_points_sse_soa(src_x.data(), src_y.data(),
                                       dst_x.data(), dst_y.data(), cur_n, mat); },
         {},
-        &dst_x[0], &dst_y[0]
+        get_soa
     });
     methods.push_back({
         "sse_aosoa",
         [&]{ transform_points_sse_aosoa(src_aosoa.data(), dst_aosoa.data(), cur_n, mat); },
         {},
-        &dst_aosoa[0].x[0], &dst_aosoa[0].y[0]
+        get_aosoa
     });
     methods.push_back({
         "sse_soa_stream",
@@ -386,13 +401,13 @@ int main(int argc, char** argv) {
                                              dst_x_aligned.get(), dst_y_aligned.get(),
                                              cur_n, mat); },
         {},
-        dst_x_aligned.get(), dst_y_aligned.get()
+        get_soa_alig
     });
     methods.push_back({
         "sse_aosoa_stream",
         [&]{ transform_points_sse_aosoa_stream(src_aosoa.data(), dst_aosoa.data(), cur_n, mat); },
         {},
-        &dst_aosoa[0].x[0], &dst_aosoa[0].y[0]
+        get_aosoa
     });
 
     // ===== In-place methods (dst == src) =====
@@ -419,37 +434,43 @@ int main(int argc, char** argv) {
     auto reset_soa_alig = [&]{ std::memcpy(ip_x_aligned.get(),    src_x.data(),     cur_n * sizeof(float));
                                std::memcpy(ip_y_aligned.get(),    src_y.data(),     cur_n * sizeof(float)); };
 
+    // Per-layout getters for in-place buffers.
+    auto get_ip_aos      = [&](std::size_t i) -> Point2 { return ip_aos[i]; };
+    auto get_ip_soa      = [&](std::size_t i) -> Point2 { return { ip_x[i], ip_y[i] }; };
+    auto get_ip_soa_alig = [&](std::size_t i) -> Point2 { return { ip_x_aligned.get()[i], ip_y_aligned.get()[i] }; };
+    auto get_ip_aosoa    = [&](std::size_t i) -> Point2 { return { ip_aosoa[i / 8].x[i % 8], ip_aosoa[i / 8].y[i % 8] }; };
+
     std::vector<Method> methods_ip;
     methods_ip.push_back({
         "scalar",
         [&]{ transform_points(ip_aos.data(), ip_aos.data(), cur_n, mat_ip); },
         reset_aos,
-        &ip_aos[0].x, &ip_aos[0].y
+        get_ip_aos
     });
     methods_ip.push_back({
         "unroll4",
         [&]{ transform_points_unroll4(ip_aos.data(), ip_aos.data(), cur_n, mat_ip); },
         reset_aos,
-        &ip_aos[0].x, &ip_aos[0].y
+        get_ip_aos
     });
     methods_ip.push_back({
         "sse",
         [&]{ transform_points_sse(ip_aos.data(), ip_aos.data(), cur_n, mat_ip); },
         reset_aos,
-        &ip_aos[0].x, &ip_aos[0].y
+        get_ip_aos
     });
     methods_ip.push_back({
         "sse_soa",
         [&]{ transform_points_sse_soa(ip_x.data(), ip_y.data(),
                                       ip_x.data(), ip_y.data(), cur_n, mat_ip); },
         reset_soa,
-        &ip_x[0], &ip_y[0]
+        get_ip_soa
     });
     methods_ip.push_back({
         "sse_aosoa",
         [&]{ transform_points_sse_aosoa(ip_aosoa.data(), ip_aosoa.data(), cur_n, mat_ip); },
         reset_aosoa,
-        &ip_aosoa[0].x[0], &ip_aosoa[0].y[0]
+        get_ip_aosoa
     });
     methods_ip.push_back({
         "sse_soa_stream",
@@ -457,13 +478,13 @@ int main(int argc, char** argv) {
                                              ip_x_aligned.get(), ip_y_aligned.get(),
                                              cur_n, mat_ip); },
         reset_soa_alig,
-        ip_x_aligned.get(), ip_y_aligned.get()
+        get_ip_soa_alig
     });
     methods_ip.push_back({
         "sse_aosoa_stream",
         [&]{ transform_points_sse_aosoa_stream(ip_aosoa.data(), ip_aosoa.data(), cur_n, mat_ip); },
         reset_aosoa,
-        &ip_aosoa[0].x[0], &ip_aosoa[0].y[0]
+        get_ip_aosoa
     });
 
     // ----- Thread pools + threaded method variants -----
@@ -491,36 +512,36 @@ int main(int argc, char** argv) {
         v.push_back({ "scalar",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points(src.data() + b, dst.data() + b, c, mat); }),
-            {}, &dst[0].x, &dst[0].y });
+            {}, get_aos });
         v.push_back({ "unroll4",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_unroll4(src.data() + b, dst.data() + b, c, mat); }),
-            {}, &dst[0].x, &dst[0].y });
+            {}, get_aos });
         v.push_back({ "sse",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse(src.data() + b, dst.data() + b, c, mat); }),
-            {}, &dst[0].x, &dst[0].y });
+            {}, get_aos });
         v.push_back({ "sse_soa",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse_soa(src_x.data()+b, src_y.data()+b,
                                          dst_x.data()+b, dst_y.data()+b, c, mat); }),
-            {}, &dst_x[0], &dst_y[0] });
+            {}, get_soa });
         v.push_back({ "sse_aosoa",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse_aosoa(src_aosoa.data() + b/8,
                                            dst_aosoa.data() + b/8, c, mat); }),
-            {}, &dst_aosoa[0].x[0], &dst_aosoa[0].y[0] });
+            {}, get_aosoa });
         v.push_back({ "sse_soa_stream",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse_soa_stream(src_x.data()+b, src_y.data()+b,
                                                 dst_x_aligned.get()+b, dst_y_aligned.get()+b,
                                                 c, mat); }),
-            {}, dst_x_aligned.get(), dst_y_aligned.get() });
+            {}, get_soa_alig });
         v.push_back({ "sse_aosoa_stream",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse_aosoa_stream(src_aosoa.data() + b/8,
                                                   dst_aosoa.data() + b/8, c, mat); }),
-            {}, &dst_aosoa[0].x[0], &dst_aosoa[0].y[0] });
+            {}, get_aosoa });
         return v;
     };
 
@@ -529,35 +550,35 @@ int main(int argc, char** argv) {
         v.push_back({ "scalar",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points(ip_aos.data()+b, ip_aos.data()+b, c, mat_ip); }),
-            reset_aos, &ip_aos[0].x, &ip_aos[0].y });
+            reset_aos, get_ip_aos });
         v.push_back({ "unroll4",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_unroll4(ip_aos.data()+b, ip_aos.data()+b, c, mat_ip); }),
-            reset_aos, &ip_aos[0].x, &ip_aos[0].y });
+            reset_aos, get_ip_aos });
         v.push_back({ "sse",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse(ip_aos.data()+b, ip_aos.data()+b, c, mat_ip); }),
-            reset_aos, &ip_aos[0].x, &ip_aos[0].y });
+            reset_aos, get_ip_aos });
         v.push_back({ "sse_soa",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse_soa(ip_x.data()+b, ip_y.data()+b,
                                          ip_x.data()+b, ip_y.data()+b, c, mat_ip); }),
-            reset_soa, &ip_x[0], &ip_y[0] });
+            reset_soa, get_ip_soa });
         v.push_back({ "sse_aosoa",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse_aosoa(ip_aosoa.data()+b/8, ip_aosoa.data()+b/8, c, mat_ip); }),
-            reset_aosoa, &ip_aosoa[0].x[0], &ip_aosoa[0].y[0] });
+            reset_aosoa, get_ip_aosoa });
         v.push_back({ "sse_soa_stream",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse_soa_stream(ip_x_aligned.get()+b, ip_y_aligned.get()+b,
                                                 ip_x_aligned.get()+b, ip_y_aligned.get()+b,
                                                 c, mat_ip); }),
-            reset_soa_alig, ip_x_aligned.get(), ip_y_aligned.get() });
+            reset_soa_alig, get_ip_soa_alig });
         v.push_back({ "sse_aosoa_stream",
             make_threaded(p, [&](std::size_t b, std::size_t c){
                 transform_points_sse_aosoa_stream(ip_aosoa.data()+b/8,
                                                   ip_aosoa.data()+b/8, c, mat_ip); }),
-            reset_aosoa, &ip_aosoa[0].x[0], &ip_aosoa[0].y[0] });
+            reset_aosoa, get_ip_aosoa });
         return v;
     };
 
@@ -565,6 +586,20 @@ int main(int argc, char** argv) {
     std::vector<Method> methods_ip_mt10 = make_ip_methods(pool10);
     std::vector<Method> methods_mt4     = make_oop_methods(pool4);
     std::vector<Method> methods_ip_mt4  = make_ip_methods(pool4);
+
+    // ----- Cache-thrash buffer for cold-cache bench -----
+    // Sized to exceed typical LLC (i7-14700HX has 33 MB L3). 128 MB guarantees
+    // every line of working-set + dst gets evicted between iterations.
+    constexpr std::size_t CACHE_THRASH_BYTES = 128ull * 1024 * 1024;
+    std::vector<unsigned char> thrash_buf(CACHE_THRASH_BYTES, 0);
+    auto thrash_cache = [&]{
+        // Touch one byte per 64-byte line. Increment forces a write (dirty line)
+        // so the cache controller must evict, not just invalidate.
+        unsigned char* p = thrash_buf.data();
+        for (std::size_t i = 0; i < CACHE_THRASH_BYTES; i += 64) {
+            p[i] += 1;
+        }
+    };
 
     // ----- Benchmark runner -----
     using Grid = std::vector<std::vector<double>>;
@@ -581,12 +616,89 @@ int main(int argc, char** argv) {
                     auto t0 = std::chrono::high_resolution_clock::now();
                     method.run();
                     auto t1 = std::chrono::high_resolution_clock::now();
-                    total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    // Skip first WARMUP_ITERS samples: cold-cache cost on iter 0
+                    // would otherwise inflate the mean of a "warm" measurement.
+                    if (it >= WARMUP_ITERS) {
+                        total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    }
                 }
-                grid[mi][si] = total_ms / ITERATIONS;
+                grid[mi][si] = total_ms / (ITERATIONS - WARMUP_ITERS);
             }
         }
         return grid;
+    };
+
+    // Cold-cache bench: thrash 128 MB scratch buffer before EACH timed iter so
+    // every method runs against an evicted src/dst. Reset happens each iter too
+    // because thrash itself wrote to memory (and we want a clean starting state
+    // for in-place methods). Thrash + reset time is NOT included in the sample.
+    // Fewer iterations than warm bench since each iter costs ~5-10 ms of thrash.
+    constexpr int COLD_ITERATIONS = 20;
+    auto bench_cold = [&](const std::vector<Method>& ms) {
+        const int mc = static_cast<int>(ms.size());
+        Grid grid(mc, std::vector<double>(SIZE_COUNT));
+        for (int si = 0; si < SIZE_COUNT; ++si) {
+            cur_n = sizes[si];
+            for (int mi = 0; mi < mc; ++mi) {
+                const Method& method = ms[mi];
+                double total_ms = 0.0;
+                for (int it = 0; it < COLD_ITERATIONS; ++it) {
+                    if (method.reset) method.reset();
+                    thrash_cache();
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    method.run();
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                }
+                grid[mi][si] = total_ms / COLD_ITERATIONS;
+            }
+        }
+        return grid;
+    };
+
+    // ----- Verify: every method must match scalar bit-for-bit (or within float eps). -----
+    // Picks one N, runs scalar to capture reference, then runs each method and
+    // compares its dst (via Method::get) elementwise. Reports max absolute diff
+    // in x or y, plus the worst index and both points there.
+    auto verify = [&](const char* label, const std::vector<Method>& ms) {
+        const std::size_t N = 1'000'000;  // big enough to exercise vector tails
+        cur_n = N;
+        std::printf("\n=== Verify: %s (N=%zu) ===\n", label, N);
+        if (ms.empty()) return;
+
+        // Reference = scalar (assumed at index 0).
+        const Method& ref = ms[0];
+        if (ref.reset) ref.reset();
+        ref.run();
+        std::vector<Point2> reference(N);
+        for (std::size_t i = 0; i < N; ++i) reference[i] = ref.get(i);
+
+        for (int mi = 0; mi < static_cast<int>(ms.size()); ++mi) {
+            const Method& m = ms[mi];
+            if (m.reset) m.reset();
+            m.run();
+
+            double max_diff = 0.0;
+            std::size_t worst = 0;
+            std::size_t mismatches = 0;
+            for (std::size_t i = 0; i < N; ++i) {
+                Point2 p = m.get(i);
+                double dx = std::fabs(static_cast<double>(p.x) - static_cast<double>(reference[i].x));
+                double dy = std::fabs(static_cast<double>(p.y) - static_cast<double>(reference[i].y));
+                double d = dx > dy ? dx : dy;
+                if (d > 0.0) ++mismatches;
+                if (d > max_diff) { max_diff = d; worst = i; }
+            }
+            if (max_diff == 0.0) {
+                std::printf("  %-18s IDENTICAL to scalar\n", m.name);
+            } else {
+                Point2 mp = m.get(worst);
+                std::printf("  %-18s max_abs_diff=%.3e  mismatches=%zu/%zu  worst idx=%zu  scalar=(%.7f,%.7f)  method=(%.7f,%.7f)\n",
+                            m.name, max_diff, mismatches, N, worst,
+                            reference[worst].x, reference[worst].y,
+                            mp.x, mp.y);
+            }
+        }
     };
 
     auto write_csv = [&](const char* filename, const std::vector<Method>& ms, const Grid& g) {
@@ -618,8 +730,8 @@ int main(int argc, char** argv) {
         return static_cast<int>(p + 0.5);
     };
 
-    auto print_grid = [&](const char* label, const std::vector<Method>& ms, const Grid& g) {
-        std::printf("\n=== %s (ms with (NN%%) vs scalar, %d iterations) ===\n", label, ITERATIONS);
+    auto print_grid_iters = [&](const char* label, int iters, const std::vector<Method>& ms, const Grid& g) {
+        std::printf("\n=== %s (ms with (NN%%) vs scalar, %d iterations) ===\n", label, iters);
         std::printf("  %-18s", "method \\ N");
         for (int si = 0; si < SIZE_COUNT; ++si) std::printf(" %18zu", sizes[si]);
         std::printf("\n");
@@ -631,74 +743,148 @@ int main(int argc, char** argv) {
             std::printf("\n");
         }
     };
+    auto print_grid = [&](const char* label, const std::vector<Method>& ms, const Grid& g) {
+        print_grid_iters(label, ITERATIONS - WARMUP_ITERS, ms, g);
+    };
 
+    auto print_grid_speedup_iters = [&](const char* label, int iters, int nth,
+                                        const std::vector<Method>& ms, const Grid& g) {
+        std::printf("\n=== %s (ms with (NN%%) vs scalar, %d iterations, %d threads) ===\n",
+                    label, iters, nth);
+        std::printf("  %-18s", "method \\ N");
+        for (int si = 0; si < SIZE_COUNT; ++si) std::printf(" %18zu", sizes[si]);
+        std::printf("\n");
+        for (int mi = 0; mi < static_cast<int>(ms.size()); ++mi) {
+            std::printf("  %-18s", ms[mi].name);
+            for (int si = 0; si < SIZE_COUNT; ++si) {
+                std::printf("  %8.4f (%5d%%)", g[mi][si], pct_vs_scalar(g, mi, si));
+            }
+            std::printf("\n");
+        }
+    };
     auto print_grid_speedup = [&](const char* label, int nth,
                                   const std::vector<Method>& ms,
                                   const Grid& g, const Grid& /*baseline*/) {
-        std::printf("\n=== %s (ms with (NN%%) vs scalar, %d iterations, %d threads) ===\n",
-                    label, ITERATIONS, nth);
-        std::printf("  %-18s", "method \\ N");
-        for (int si = 0; si < SIZE_COUNT; ++si) std::printf(" %18zu", sizes[si]);
-        std::printf("\n");
-        for (int mi = 0; mi < static_cast<int>(ms.size()); ++mi) {
-            std::printf("  %-18s", ms[mi].name);
-            for (int si = 0; si < SIZE_COUNT; ++si) {
-                std::printf("  %8.4f (%5d%%)", g[mi][si], pct_vs_scalar(g, mi, si));
-            }
-            std::printf("\n");
-        }
+        print_grid_speedup_iters(label, ITERATIONS - WARMUP_ITERS, nth, ms, g);
     };
 
-    std::printf("Benchmarking %d method(s) across %d size(s), %d iters%s\n",
-                static_cast<int>(methods.size()), SIZE_COUNT, ITERATIONS,
+    std::printf("Benchmarking %d method(s) across %d size(s), %d iters (+%d warmup discarded)%s\n",
+                static_cast<int>(methods.size()), SIZE_COUNT,
+                ITERATIONS - WARMUP_ITERS, WARMUP_ITERS,
                 verbose ? " [verbose]" : "");
 
-    Grid g_oop = bench(methods);
-    print_grid("Out-of-place (1 thread)", methods, g_oop);
-    write_csv("results_oop_1t.csv", methods, g_oop);
-
-    Grid g_ip  = bench(methods_ip);
-    print_grid("In-place (1 thread, rotation-only mat)", methods_ip, g_ip);
-    write_csv("results_ip_1t.csv", methods_ip, g_ip);
-
-    Grid g_oop_mt4 = bench(methods_mt4);
-    print_grid_speedup("Out-of-place (4 threads)", 4, methods_mt4, g_oop_mt4, g_oop);
-    write_csv("results_oop_4t.csv", methods_mt4, g_oop_mt4);
-
-    Grid g_ip_mt4 = bench(methods_ip_mt4);
-    print_grid_speedup("In-place (4 threads, rotation-only mat)", 4, methods_ip_mt4, g_ip_mt4, g_ip);
-    write_csv("results_ip_4t.csv", methods_ip_mt4, g_ip_mt4);
-
-    Grid g_oop_mt10 = bench(methods_mt10);
-    print_grid_speedup("Out-of-place (10 threads)", 10, methods_mt10, g_oop_mt10, g_oop);
-    write_csv("results_oop_10t.csv", methods_mt10, g_oop_mt10);
-
-    Grid g_ip_mt10  = bench(methods_ip_mt10);
-    print_grid_speedup("In-place (10 threads, rotation-only mat)", 10, methods_ip_mt10, g_ip_mt10, g_ip);
-    write_csv("results_ip_10t.csv", methods_ip_mt10, g_ip_mt10);
-
-    // Long-form combined CSV (good for pivots / scripted plotting).
-    FILE* lf = std::fopen("results_long.csv", "w");
-    if (lf) {
-        std::fprintf(lf, "table,threads,inplace,method,N,avg_ms\n");
-        auto dump = [&](const char* table, int threads, int inplace,
-                        const std::vector<Method>& ms, const Grid& g) {
-            for (int mi = 0; mi < static_cast<int>(ms.size()); ++mi) {
-                for (int si = 0; si < SIZE_COUNT; ++si) {
-                    std::fprintf(lf, "%s,%d,%d,%s,%zu,%.6f\n",
-                                 table, threads, inplace,
-                                 ms[mi].name, sizes[si], g[mi][si]);
-                }
-            }
-        };
-        dump("oop_1t",  1,  0, methods,         g_oop);
-        dump("ip_1t",   1,  1, methods_ip,      g_ip);
-        dump("oop_4t",  4,  0, methods_mt4,     g_oop_mt4);
-        dump("ip_4t",   4,  1, methods_ip_mt4,  g_ip_mt4);
-        dump("oop_10t", 10, 0, methods_mt10,    g_oop_mt10);
-        dump("ip_10t",  10, 1, methods_ip_mt10, g_ip_mt10);
-        std::fclose(lf);
-        std::printf("[csv] wrote results_long.csv\n");
+    // ----- Verify pass: every method must match scalar. -----
+    if (do_verify) {
+        verify("Out-of-place (1 thread)",          methods);
+        verify("In-place (1 thread)",              methods_ip);
+        verify("Out-of-place (4 threads)",         methods_mt4);
+        verify("In-place (4 threads)",             methods_ip_mt4);
+        verify("Out-of-place (10 threads)",        methods_mt10);
+        verify("In-place (10 threads)",            methods_ip_mt10);
     }
+
+    if (do_warm) {
+        Grid g_oop = bench(methods);
+        print_grid("Out-of-place (1 thread)", methods, g_oop);
+        write_csv("results_oop_1t.csv", methods, g_oop);
+
+        Grid g_ip  = bench(methods_ip);
+        print_grid("In-place (1 thread, rotation-only mat)", methods_ip, g_ip);
+        write_csv("results_ip_1t.csv", methods_ip, g_ip);
+
+        Grid g_oop_mt4 = bench(methods_mt4);
+        print_grid_speedup("Out-of-place (4 threads)", 4, methods_mt4, g_oop_mt4, g_oop);
+        write_csv("results_oop_4t.csv", methods_mt4, g_oop_mt4);
+
+        Grid g_ip_mt4 = bench(methods_ip_mt4);
+        print_grid_speedup("In-place (4 threads, rotation-only mat)", 4, methods_ip_mt4, g_ip_mt4, g_ip);
+        write_csv("results_ip_4t.csv", methods_ip_mt4, g_ip_mt4);
+
+        Grid g_oop_mt10 = bench(methods_mt10);
+        print_grid_speedup("Out-of-place (10 threads)", 10, methods_mt10, g_oop_mt10, g_oop);
+        write_csv("results_oop_10t.csv", methods_mt10, g_oop_mt10);
+
+        Grid g_ip_mt10  = bench(methods_ip_mt10);
+        print_grid_speedup("In-place (10 threads, rotation-only mat)", 10, methods_ip_mt10, g_ip_mt10, g_ip);
+        write_csv("results_ip_10t.csv", methods_ip_mt10, g_ip_mt10);
+
+        // Long-form combined CSV (good for pivots / scripted plotting).
+        FILE* lf = std::fopen("results_long.csv", "w");
+        if (lf) {
+            std::fprintf(lf, "table,threads,inplace,method,N,avg_ms\n");
+            auto dump = [&](const char* table, int threads, int inplace,
+                            const std::vector<Method>& ms, const Grid& g) {
+                for (int mi = 0; mi < static_cast<int>(ms.size()); ++mi) {
+                    for (int si = 0; si < SIZE_COUNT; ++si) {
+                        std::fprintf(lf, "%s,%d,%d,%s,%zu,%.6f\n",
+                                     table, threads, inplace,
+                                     ms[mi].name, sizes[si], g[mi][si]);
+                    }
+                }
+            };
+            dump("oop_1t",  1,  0, methods,         g_oop);
+            dump("ip_1t",   1,  1, methods_ip,      g_ip);
+            dump("oop_4t",  4,  0, methods_mt4,     g_oop_mt4);
+            dump("ip_4t",   4,  1, methods_ip_mt4,  g_ip_mt4);
+            dump("oop_10t", 10, 0, methods_mt10,    g_oop_mt10);
+            dump("ip_10t",  10, 1, methods_ip_mt10, g_ip_mt10);
+            std::fclose(lf);
+            std::printf("[csv] wrote results_long.csv\n");
+        }
+    }
+
+    // ----- Cold-cache pass: 128 MB scratch thrashed before each iter. -----
+    if (do_cold) {
+        std::printf("\n############ COLD CACHE (thrash %zu MB between iters) ############\n",
+                    CACHE_THRASH_BYTES / (1024 * 1024));
+
+        Grid c_oop = bench_cold(methods);
+        print_grid_iters("COLD Out-of-place (1 thread)", COLD_ITERATIONS, methods, c_oop);
+        write_csv("results_cold_oop_1t.csv", methods, c_oop);
+
+        Grid c_ip  = bench_cold(methods_ip);
+        print_grid_iters("COLD In-place (1 thread, rotation-only mat)", COLD_ITERATIONS, methods_ip, c_ip);
+        write_csv("results_cold_ip_1t.csv", methods_ip, c_ip);
+
+        Grid c_oop_mt4 = bench_cold(methods_mt4);
+        print_grid_speedup_iters("COLD Out-of-place (4 threads)", COLD_ITERATIONS, 4, methods_mt4, c_oop_mt4);
+        write_csv("results_cold_oop_4t.csv", methods_mt4, c_oop_mt4);
+
+        Grid c_ip_mt4 = bench_cold(methods_ip_mt4);
+        print_grid_speedup_iters("COLD In-place (4 threads, rotation-only mat)", COLD_ITERATIONS, 4, methods_ip_mt4, c_ip_mt4);
+        write_csv("results_cold_ip_4t.csv", methods_ip_mt4, c_ip_mt4);
+
+        Grid c_oop_mt10 = bench_cold(methods_mt10);
+        print_grid_speedup_iters("COLD Out-of-place (10 threads)", COLD_ITERATIONS, 10, methods_mt10, c_oop_mt10);
+        write_csv("results_cold_oop_10t.csv", methods_mt10, c_oop_mt10);
+
+        Grid c_ip_mt10  = bench_cold(methods_ip_mt10);
+        print_grid_speedup_iters("COLD In-place (10 threads, rotation-only mat)", COLD_ITERATIONS, 10, methods_ip_mt10, c_ip_mt10);
+        write_csv("results_cold_ip_10t.csv", methods_ip_mt10, c_ip_mt10);
+
+        FILE* lf = std::fopen("results_cold_long.csv", "w");
+        if (lf) {
+            std::fprintf(lf, "table,threads,inplace,method,N,avg_ms\n");
+            auto dump = [&](const char* table, int threads, int inplace,
+                            const std::vector<Method>& ms, const Grid& g) {
+                for (int mi = 0; mi < static_cast<int>(ms.size()); ++mi) {
+                    for (int si = 0; si < SIZE_COUNT; ++si) {
+                        std::fprintf(lf, "%s,%d,%d,%s,%zu,%.6f\n",
+                                     table, threads, inplace,
+                                     ms[mi].name, sizes[si], g[mi][si]);
+                    }
+                }
+            };
+            dump("cold_oop_1t",  1,  0, methods,         c_oop);
+            dump("cold_ip_1t",   1,  1, methods_ip,      c_ip);
+            dump("cold_oop_4t",  4,  0, methods_mt4,     c_oop_mt4);
+            dump("cold_ip_4t",   4,  1, methods_ip_mt4,  c_ip_mt4);
+            dump("cold_oop_10t", 10, 0, methods_mt10,    c_oop_mt10);
+            dump("cold_ip_10t",  10, 1, methods_ip_mt10, c_ip_mt10);
+            std::fclose(lf);
+            std::printf("[csv] wrote results_cold_long.csv\n");
+        }
+    }
+
     return 0;
 }
